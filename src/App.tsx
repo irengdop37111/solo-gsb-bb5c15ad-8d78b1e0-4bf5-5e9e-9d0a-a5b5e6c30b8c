@@ -7,6 +7,13 @@ import DriftPanel from './components/DriftPanel';
 import RefDiffPanel from './components/RefDiffPanel';
 import SpeedPanel from './components/SpeedPanel';
 import GapPanel from './components/GapPanel';
+import FramePanel from './components/FramePanel';
+import {
+  FRAME_RATES,
+  frameRateById,
+  planFrameGrid,
+  serializeFrameGrid
+} from './lib/frameGrid';
 import {
   computeActivityGaps,
   DEFAULT_GAP_MERGE_BREAK,
@@ -167,6 +174,10 @@ export default function App() {
   const [gapMergeBreak, setGapMergeBreak] = useState(DEFAULT_GAP_MERGE_BREAK);
   const [gapTolerance, setGapTolerance] = useState(DEFAULT_GAP_TOLERANCE);
   const [gapMinDuration, setGapMinDuration] = useState(DEFAULT_GAP_MIN_DURATION);
+
+  // 帧率网格导出：目标帧率选择仅存当前页面内存（不进会话快照）；
+  // 对齐方案随字幕、约束与帧率实时重算，导出只生成下载副本，不改字幕与历史
+  const [frameRateId, setFrameRateId] = useState(FRAME_RATES[0].id);
 
   /* ---------------- 本地会话恢复 / 自动保存 ---------------- */
   // 当前工作区绑定的会话 id：导入 SRT 时新建；恢复会话时沿用；空白工作区为 null
@@ -699,6 +710,39 @@ export default function App() {
     setSpeedSelectedId(null);
   }, [speedFix, commit, pushToast]);
 
+  /* ---------------- 帧率网格导出 ---------------- */
+
+  const frameRate = useMemo(() => frameRateById(frameRateId), [frameRateId]);
+  // 联合对齐方案：随当前字幕、最短时长/最小间隔约束与目标帧率实时重算
+  const frameGrid = useMemo(
+    () => planFrameGrid(cues, constraints, frameRate),
+    [cues, constraints, frameRate]
+  );
+  const frameFileName = `${(srtName ?? 'subtitles.srt').replace(/\.srt$/i, '')}.frame.srt`;
+
+  /**
+   * 下载帧率网格对齐结果：仅在有解时可用；序列化毫秒时间码（帧时间四舍五入）
+   * 生成 <原名>.frame.srt 副本，当前字幕与撤销/重做历史保持不变。
+   */
+  const exportFrameGrid = useCallback(() => {
+    if (!frameGrid || !frameGrid.ok) return;
+    const blob = new Blob([serializeFrameGrid(cues, frameGrid.plans)], {
+      type: 'text/plain;charset=utf-8'
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = frameFileName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    pushToast(
+      'info',
+      `已按 ${frameRate.label} fps 帧率网格导出 ${frameGrid.plans.length} 条（当前字幕与撤销历史未改动）`
+    );
+  }, [frameGrid, cues, frameFileName, frameRate, pushToast]);
+
   /* ---------------- SRT ---------------- */
 
   const handleImportSrt = useCallback(
@@ -1213,6 +1257,13 @@ export default function App() {
     if (activityGaps && activityGaps.gaps.length > 0) {
       parts.push(`疑似未覆盖音频活动 ${activityGaps.gaps.length} 段`);
     }
+    if (frameGrid) {
+      parts.push(
+        frameGrid.ok
+          ? `帧率网格 ${frameRate.label}：总误差 ${frameGrid.totalErrorMs.toFixed(1)}ms`
+          : `帧率网格 ${frameRate.label} 无解：第 ${frameGrid.index} 条无法接续`
+      );
+    }
     if (audioPending) parts.push('等待重新选择音频（播放已停用，编辑/导出不受影响）');
     if (sessionId) {
       if (!autoSave) parts.push('自动保存已停用');
@@ -1242,7 +1293,9 @@ export default function App() {
     refStats,
     speedOverEntries,
     speedThreshold,
-    activityGaps
+    activityGaps,
+    frameGrid,
+    frameRate
   ]);
 
   return (
@@ -1410,6 +1463,15 @@ export default function App() {
             onToleranceChange={setGapTolerance}
             onMinDurationChange={setGapMinDuration}
             onLocate={handleGapLocate}
+          />
+          <FramePanel
+            totalCount={cues.length}
+            constraints={constraints}
+            rateId={frameRateId}
+            onRateChange={setFrameRateId}
+            result={frameGrid}
+            fileName={frameFileName}
+            onExport={exportFrameGrid}
           />
         </section>
         <CueList

@@ -61,6 +61,17 @@ import {
   mergeCueIntervals,
   subtractCueIntervals
 } from '../src/lib/activityGaps';
+import {
+  FRAME_RATES,
+  applyFramePlan,
+  frameCandidates,
+  frameRateById,
+  frameTimeMs,
+  frameTimeSeconds,
+  nearestFrame,
+  planFrameGrid,
+  serializeFrameGrid
+} from '../src/lib/frameGrid';
 
 let fail = 0;
 function assert(cond: boolean, msg: string) {
@@ -1018,6 +1029,167 @@ assert(validateSession(nullAudio).ok, '无音频指纹的会话合法');
     { threshold: 0.01, mergeBreak: 0.25, tolerance: 0, minDuration: 0.5 }
   );
   assert(raised.activity.length === 0 && raised.gaps.length === 0, '弱信号低于阈值无活动段');
+}
+
+/* ---------------- 帧率网格导出：候选帧、分数时间与联合求解 ---------------- */
+
+{
+  // 34. 帧率表与分数时间计算（直接按 k·den/num，不累计）
+  assert(FRAME_RATES.map((r) => r.id).join(',') === '24,25,30,30000/1001', '四种目标帧率 24/25/30/30000/1001');
+  const r24 = frameRateById('24');
+  const rdf = frameRateById('30000/1001');
+  assert(frameTimeSeconds(r24, 48) === 2, '24fps 帧 48 = 2.000s');
+  assert(frameTimeSeconds(rdf, 30000) === 1001, '30000/1001：帧 30000 = 1001s（分数直接计算）');
+  assert(Math.abs(frameTimeSeconds(rdf, 30) - 1.001) < 1e-12, '30000/1001：帧 30 = 1.001s');
+  assert(frameTimeMs(rdf, 1) === 33, '30000/1001：帧 1 = 33ms（33.37 四舍五入）');
+  assert(frameTimeMs(rdf, 3) === 100, '30000/1001：帧 3 = 100ms（100.1 四舍五入）');
+  assert(frameTimeMs(frameRateById('25'), 5) === 200, '25fps：帧 5 = 200ms');
+
+  // 35. 最近帧：等距取较早帧
+  assert(nearestFrame(r24, 1.5 / 24) === 1, '恰在帧 1/2 等距点取较早帧 1');
+  assert(nearestFrame(r24, 2.5 / 24) === 2, '恰在帧 2/3 等距点取较早帧 2');
+  assert(nearestFrame(r24, 0.9 / 24) === 1, '偏近帧 1');
+  assert(nearestFrame(r24, 1.0 / 24) === 1, '恰好落在帧 1');
+  assert(nearestFrame(rdf, 1) === 30, '30000/1001：1.0s 最近帧 30（29.97 帧/秒）');
+
+  // 36. 候选帧 = 最近帧 ±2；负帧号剔除（起点不早于 0）
+  assert(JSON.stringify(frameCandidates(r24, 0)) === '[0,1,2]', '0s 候选仅保留非负帧 [0,1,2]');
+  assert(JSON.stringify(frameCandidates(r24, 1)) === '[22,23,24,25,26]', '1s 候选为帧 22..26');
+  assert(JSON.stringify(frameCandidates(frameRateById('25'), 0.02)) === '[0,1,2]', '25fps 20ms（0/1 等距点取 0）候选 [0,1,2]');
+
+  const C = { minDuration: 0.5, minGap: 0.08 };
+
+  // 37. 恰好落在网格上：零误差、毫秒时间码为整数帧时间
+  {
+    const gridCues = [
+      { id: 'a', start: 1, end: 2, text: 'a' },
+      { id: 'b', start: 3, end: 4, text: 'b' }
+    ];
+    const res = planFrameGrid(gridCues, C, r24)!;
+    assert(res.ok && res.totalErrorMs === 0, '网格点对齐总误差为 0');
+    if (res.ok) {
+      assert(
+        JSON.stringify(res.plans.map((p) => [p.startFrame, p.endFrame])) === '[[24,48],[72,96]]',
+        '帧号 [24,48] 与 [72,96]'
+      );
+      assert(
+        JSON.stringify(res.plans.map((p) => [p.newStartMs, p.newEndMs])) === '[[1000,2000],[3000,4000]]',
+        '毫秒时间码 1000/2000/3000/4000'
+      );
+    }
+    assert(planFrameGrid([], C, r24) === null, '无字幕返回 null');
+  }
+
+  // 38. 同分取帧号序列字典序最小（25fps 帧 = 40ms，半帧点 20ms 为毫秒整数）
+  {
+    // 起 20ms 等距帧 0/1、止 220ms 等距帧 5/6：四组方案误差同为 40ms，取 (0,5)
+    const tieCues = [{ id: 'a', start: 0.02, end: 0.22, text: 'a' }];
+    const res = planFrameGrid(tieCues, { minDuration: 0.04, minGap: 0.08 }, frameRateById('25'))!;
+    assert(res.ok, '等距点方案可行');
+    if (res.ok) {
+      assert(res.plans[0].startFrame === 0 && res.plans[0].endFrame === 5, `字典序最小帧号 (0,5)（实际 (${res.plans[0].startFrame},${res.plans[0].endFrame})）`);
+      assert(Math.abs(res.totalErrorMs - 40) < 1e-9, '总误差 40ms（20+20）');
+    }
+  }
+
+  // 39. 联合选择：逐条取最近帧会违反最小间隔，跨字幕挪动后得到全局最优
+  {
+    // 25fps：a[0,40ms] b[80ms,120ms]，最小间隔 80ms（2 帧）
+    const jointCues = [
+      { id: 'a', start: 0, end: 0.04, text: 'a' },
+      { id: 'b', start: 0.08, end: 0.12, text: 'b' }
+    ];
+    const res = planFrameGrid(jointCues, { minDuration: 0.04, minGap: 0.08 }, frameRateById('25'))!;
+    assert(res.ok, '联合挪动后有解');
+    if (res.ok) {
+      assert(
+        JSON.stringify(res.plans.map((p) => [p.startFrame, p.endFrame])) === '[[0,1],[3,4]]',
+        'b 整体后挪 1 帧：(0,1) 与 (3,4)，间隔恰为 80ms'
+      );
+      assert(
+        JSON.stringify(res.plans.map((p) => [p.newStartMs, p.newEndMs])) === '[[0,40],[120,160]]',
+        '毫秒时间码 0/40 与 120/160'
+      );
+      assert(Math.abs(res.totalErrorMs - 80) < 1e-9, '总误差 80ms（40+40）');
+    }
+  }
+
+  // 40. 无解-自身时长：候选帧（±2）内最长时长仍低于最短时长 -> 首条、min-duration
+  {
+    const shortCues = [{ id: 'a', start: 1, end: 1.01, text: 'a' }];
+    const res = planFrameGrid(shortCues, { minDuration: 0.5, minGap: 0.08 }, r24)!;
+    assert(
+      !res.ok && res.kind === 'min-duration' && res.index === 1 && res.cueId === 'a',
+      '候选内时长不足：定位第 1 条 min-duration'
+    );
+    if (!res.ok) assert(res.reason.includes('最长时长') && res.reason.includes('500'), `原因含最长时长与下限：${res.reason}`);
+  }
+
+  // 41. 无解-无法接续：与上一条候选间隔最大仍小于最小间隔 -> 第 2 条、min-gap
+  {
+    const gapCues = [
+      { id: 'a', start: 0, end: 1, text: 'a' },
+      { id: 'b', start: 1.01, end: 2, text: 'b' }
+    ];
+    const res = planFrameGrid(gapCues, { minDuration: 0.01, minGap: 0.5 }, r24)!;
+    assert(
+      !res.ok && res.kind === 'min-gap' && res.index === 2 && res.cueId === 'b',
+      '间隔候选不足：定位第 2 条 min-gap'
+    );
+    if (!res.ok) {
+      assert(res.reason.includes('上一条') && res.reason.includes('最大为'), `原因含上一条与最大间隔：${res.reason}`);
+      assert(res.reason.includes('166'), `24fps ±2 候选最大间隔 4 帧 ≈ 166ms：${res.reason}`);
+    }
+  }
+
+  // 42. 30000/1001 分数网格：1.001s 恰为帧 30，零误差且毫秒为 1001
+  {
+    const dfCues = [{ id: 'a', start: 0, end: 1.001, text: 'a' }];
+    const res = planFrameGrid(dfCues, { minDuration: 0.5, minGap: 0.08 }, rdf)!;
+    assert(res.ok && res.totalErrorMs === 0, '30000/1001：1.001s 网格点零误差');
+    if (res.ok) {
+      assert(res.plans[0].endFrame === 30 && res.plans[0].newEndMs === 1001, '帧 30 对应 1001ms');
+    }
+  }
+
+  // 43. 导出序列化：时间重排连续编号、帧时间毫秒取整、原字幕不被修改
+  {
+    const expCues = [
+      { id: 'b', start: 0.08, end: 0.12, text: '第二' },
+      { id: 'a', start: 0, end: 0.04, text: '第一' }
+    ];
+    const res = planFrameGrid(expCues, { minDuration: 0.04, minGap: 0.08 }, frameRateById('25'))!;
+    assert(res.ok, '导出用方案有解');
+    if (res.ok) {
+      const text = serializeFrameGrid(expCues, res.plans);
+      assert(text.startsWith('1\n00:00:00,000 --> 00:00:00,040'), `首块时间码：${text.split('\n')[1]}`);
+      assert(text.includes('2\n00:00:00,120 --> 00:00:00,160'), '次块为后挪后的 120→160ms');
+      const nums = [...text.matchAll(/^(\d+)$/gm)].map((m) => Number(m[1]));
+      assert(JSON.stringify(nums) === '[1,2]', '导出编号连续 1,2');
+      const mapped = applyFramePlan(expCues, res.plans);
+      assert(mapped !== expCues && mapped[0] !== expCues[0], 'applyFramePlan 返回新数组/新对象');
+      assert(
+        expCues[0].start === 0.08 && expCues[1].start === 0 && expCues[0].end === 0.12,
+        '原字幕未被修改（撤销历史不受影响）'
+      );
+    }
+  }
+
+  // 44. 约束恰在下限合法：1 帧时长 / 间隔恰好等于下限（毫秒取整后）
+  {
+    const edgeCues = [
+      { id: 'a', start: 0, end: 0.04, text: 'a' },
+      { id: 'b', start: 0.08, end: 0.12, text: 'b' }
+    ];
+    const res = planFrameGrid(edgeCues, { minDuration: 0.04, minGap: 0.04 }, frameRateById('25'))!;
+    assert(res.ok, '间隔恰好 40ms（1 帧）合法：最近帧直接成立');
+    if (res.ok) {
+      assert(
+        JSON.stringify(res.plans.map((p) => [p.startFrame, p.endFrame])) === '[[0,1],[2,3]]',
+        '帧号无需挪动 (0,1)/(2,3)'
+      );
+    }
+  }
 }
 
 process.exit(fail ? 1 : 0);
