@@ -61,6 +61,15 @@ import {
   mergeCueIntervals,
   subtractCueIntervals
 } from '../src/lib/activityGaps';
+import {
+  applyFrameGrid,
+  frameCandidates,
+  frameRateById,
+  frameToMs,
+  FRAME_RATES,
+  nearestFrame,
+  planFrameGrid
+} from '../src/lib/frameGrid';
 
 let fail = 0;
 function assert(cond: boolean, msg: string) {
@@ -1018,6 +1027,190 @@ assert(validateSession(nullAudio).ok, '无音频指纹的会话合法');
     { threshold: 0.01, mergeBreak: 0.25, tolerance: 0, minDuration: 0.5 }
   );
   assert(raised.activity.length === 0 && raised.gaps.length === 0, '弱信号低于阈值无活动段');
+}
+
+/* ---------------- 帧率网格导出 ---------------- */
+
+// 34. 最近帧（等距取较早帧）、帧时间分数计算与候选帧
+{
+  const r25 = frameRateById('25'); // 40ms/帧
+  assert(nearestFrame(1000, r25) === 25, '1.000s @25fps -> 帧 25');
+  assert(nearestFrame(1020, r25) === 25, '等距（25.5 帧）取较早帧 25');
+  assert(nearestFrame(1021, r25) === 26, '超过半帧取 26');
+  assert(nearestFrame(1019, r25) === 25, '不足半帧取 25');
+  const r2 = { id: 't', label: '2', num: 2, den: 1 }; // 合成 2fps：500ms/帧
+  assert(nearestFrame(1250, r2) === 2, '合成帧率等距 2.5 -> 较早帧 2');
+  assert(nearestFrame(1251, r2) === 3, '合成帧率过半帧 -> 3');
+
+  const r29 = frameRateById('30000/1001');
+  assert(frameToMs(30, r29) === 1001, '30000/1001：帧 30 恰好 1001ms');
+  assert(
+    frameToMs(30000, r29) === 1001000,
+    '30000/1001：帧 30000 恰好 1001000ms（分数计算无累计漂移）'
+  );
+  assert(nearestFrame(1001, r29) === 30, '1001ms 最近帧 30');
+  assert(frameToMs(25, r25) === 1000 && frameToMs(1, r25) === 40, '25fps 帧时间');
+  assert(frameToMs(1, { id: 't', label: '', num: 16, den: 1 }) === 63, '帧时间半毫秒四舍五入进位');
+
+  assert(frameCandidates(1000, r25).join(',') === '23,24,25,26,27', '候选为最近帧前后各 2 帧');
+  assert(frameCandidates(10, r25).join(',') === '0,1,2', '起点不早于 0：负帧被排除');
+  assert(FRAME_RATES.length === 4, '可选帧率 24/25/30/30000-1001 共 4 档');
+}
+
+// 35. 联合选帧：零误差、时长 / 间隔约束、字典序并列、无解报告
+{
+  const r25 = frameRateById('25');
+  const FC = { minDuration: 0.5, minGap: 0.08 };
+
+  // 帧上时间码：零误差
+  const exact = planFrameGrid(
+    [
+      { id: 'a', start: 1, end: 2, text: 'a' },
+      { id: 'b', start: 3, end: 4, text: 'b' }
+    ],
+    FC,
+    r25
+  );
+  assert(exact.feasible && exact.totalErrorMs === 0, '帧上时间码零误差');
+  assert(
+    exact.results[0].startFrame === 25 && exact.results[0].endFrame === 50 &&
+      exact.results[1].startFrame === 75 && exact.results[1].endFrame === 100,
+    '帧号 25→50 / 75→100'
+  );
+
+  // 乱序输入按时间序联合选择
+  const unsorted = planFrameGrid(
+    [
+      { id: 'b', start: 3, end: 4, text: 'b' },
+      { id: 'a', start: 1, end: 2, text: 'a' }
+    ],
+    FC,
+    r25
+  );
+  assert(unsorted.results[0].cueId === 'a' && unsorted.results[1].cueId === 'b', '按时间序联合选择');
+
+  // 时长约束下联合让位：1.000→1.100，最短时长 0.2s。
+  // 满足时长的并列最优（总误差 100ms）：(23,28) 与 (24,29)，取帧号序列字典序最小 (23,28)
+  const dur = planFrameGrid(
+    [{ id: 'a', start: 1, end: 1.1, text: 'a' }],
+    { minDuration: 0.2, minGap: 0 },
+    r25
+  );
+  assert(
+    dur.feasible && dur.results[0].startFrame === 23 && dur.results[0].endFrame === 28,
+    `时长约束下联合让位为 23→28（实际 ${dur.results[0]?.startFrame}→${dur.results[0]?.endFrame}）`
+  );
+  assert(
+    dur.results[0].newStartMs === 920 && dur.results[0].newEndMs === 1120 &&
+      Math.abs(dur.totalErrorMs - 100) < 1e-9,
+    '新时间码 0.920→1.120（时长恰好 200ms），总误差 100ms'
+  );
+
+  // 起止至少相隔 1 帧：1.000→1.010，最短时长 0 -> 终点不能同帧，取 25→26
+  const oneFrame = planFrameGrid(
+    [{ id: 'a', start: 1, end: 1.01, text: 'a' }],
+    { minDuration: 0, minGap: 0 },
+    r25
+  );
+  assert(
+    oneFrame.feasible && oneFrame.results[0].startFrame === 25 && oneFrame.results[0].endFrame === 26,
+    '起止至少相隔 1 帧'
+  );
+
+  // 间隔约束 + 字典序并列：c1 1.0→1.5，c2 1.6→3.0，最小间隔 0.2s。
+  // 总误差 100ms 的并列方案 (25,35,40,75) / (25,36,41,75) / (25,37,42,75)，取字典序最小
+  const tie = planFrameGrid(
+    [
+      { id: 'a', start: 1, end: 1.5, text: 'a' },
+      { id: 'b', start: 1.6, end: 3, text: 'b' }
+    ],
+    { minDuration: 0.05, minGap: 0.2 },
+    r25
+  );
+  assert(
+    tie.feasible &&
+      tie.results[0].startFrame === 25 && tie.results[0].endFrame === 35 &&
+      tie.results[1].startFrame === 40 && tie.results[1].endFrame === 75,
+    `同分取帧号序列字典序最小 (25,35,40,75)（实际 ${tie.results.map((r) => `${r.startFrame},${r.endFrame}`).join(' / ')}）`
+  );
+  assert(Math.abs(tie.totalErrorMs - 100) < 1e-9, '并列方案总误差 100ms');
+  assert(
+    tie.results[0].newEndMs === 1400 && tie.results[1].newStartMs === 1600,
+    '间隔恰好 200ms 满足最小间隔'
+  );
+
+  // 无解：间隔无法满足 -> 报告第 2 条起点，不产生部分结果
+  const noGap = planFrameGrid(
+    [
+      { id: 'a', start: 1, end: 1.5, text: 'a' },
+      { id: 'b', start: 1.55, end: 3, text: 'b' }
+    ],
+    { minDuration: 0.05, minGap: 0.5 },
+    r25
+  );
+  assert(!noGap.feasible && noGap.results.length === 0, '无解时不产生部分结果');
+  assert(
+    noGap.failure?.cueIndex === 2 && noGap.failure.edge === 'start' && noGap.failure.cueId === 'b',
+    '报告第 2 条起点无法接续'
+  );
+  assert(noGap.failure?.message.includes('间隔') ?? false, `原因指明间隔不足：${noGap.failure?.message ?? ''}`);
+
+  // 无解：时长无法满足 -> 报告第 1 条终点
+  const noDur = planFrameGrid(
+    [{ id: 'a', start: 1, end: 1.1, text: 'a' }],
+    { minDuration: 0.5, minGap: 0 },
+    r25
+  );
+  assert(
+    !noDur.feasible && noDur.failure?.cueIndex === 1 && noDur.failure.edge === 'end',
+    '报告第 1 条终点无法接续'
+  );
+  assert(noDur.failure?.message.includes('时长') ?? false, `原因指明时长不足：${noDur.failure?.message ?? ''}`);
+
+  // 起点不早于 0：0.010s 起点吸附到帧 0
+  const zero = planFrameGrid(
+    [{ id: 'a', start: 0.01, end: 1, text: 'a' }],
+    { minDuration: 0.05, minGap: 0 },
+    r25
+  );
+  assert(
+    zero.feasible && zero.results[0].startFrame === 0 && zero.results[0].newStartMs === 0,
+    '起点吸附到帧 0（不早于 0）'
+  );
+
+  // 30000/1001：帧上时间码零误差
+  const ntsc = planFrameGrid(
+    [{ id: 'a', start: 1.001, end: 2.002, text: 'a' }],
+    { minDuration: 0.5, minGap: 0 },
+    frameRateById('30000/1001')
+  );
+  assert(
+    ntsc.feasible && ntsc.totalErrorMs === 0 &&
+      ntsc.results[0].startFrame === 30 && ntsc.results[0].endFrame === 60,
+    '30000/1001 帧上时间码零误差（帧 30→60）'
+  );
+
+  // applyFrameGrid：生成新数组，原字幕对象不变；结果可由现有 SRT 导出
+  const src = [
+    { id: 'a', start: 1, end: 1.5, text: 'a' },
+    { id: 'b', start: 1.6, end: 3, text: 'b' }
+  ];
+  const tiePlan = planFrameGrid(src, { minDuration: 0.05, minGap: 0.2 }, r25);
+  const mapped = applyFrameGrid(src, tiePlan)!;
+  assert(
+    mapped[0].start === 1 && mapped[0].end === 1.4 && mapped[1].start === 1.6 && mapped[1].end === 3,
+    '映射后新时间码 1.000→1.400 / 1.600→3.000'
+  );
+  assert(src[0].end === 1.5 && mapped[0] !== src[0], '原字幕对象不变（撤销历史不受影响）');
+  const frameOut = serializeSrt(mapped);
+  assert(
+    frameOut.includes('00:00:01,000 --> 00:00:01,400') && frameOut.includes('00:00:01,600 --> 00:00:03,000'),
+    '帧时间四舍五入到毫秒导出'
+  );
+  assert(
+    applyFrameGrid(src, planFrameGrid(src, { minDuration: 0.05, minGap: 0.5 }, r25)) === null,
+    '无解时映射返回 null'
+  );
 }
 
 process.exit(fail ? 1 : 0);

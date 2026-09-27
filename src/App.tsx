@@ -7,6 +7,7 @@ import DriftPanel from './components/DriftPanel';
 import RefDiffPanel from './components/RefDiffPanel';
 import SpeedPanel from './components/SpeedPanel';
 import GapPanel from './components/GapPanel';
+import FramePanel from './components/FramePanel';
 import {
   computeActivityGaps,
   DEFAULT_GAP_MERGE_BREAK,
@@ -25,6 +26,12 @@ import {
   planReadingSpeedFix,
   type ReadingSpeedFix
 } from './lib/readingSpeed';
+import {
+  applyFrameGrid,
+  DEFAULT_FRAME_RATE_ID,
+  frameRateById,
+  planFrameGrid
+} from './lib/frameGrid';
 import type { Constraints, Cue, DriftPreview, SilenceStatus } from './types';
 import { formatClock, parseSrt, serializeSrt } from './lib/srt';
 import {
@@ -167,6 +174,10 @@ export default function App() {
   const [gapMergeBreak, setGapMergeBreak] = useState(DEFAULT_GAP_MERGE_BREAK);
   const [gapTolerance, setGapTolerance] = useState(DEFAULT_GAP_TOLERANCE);
   const [gapMinDuration, setGapMinDuration] = useState(DEFAULT_GAP_MIN_DURATION);
+
+  // 帧率网格导出：目标帧率选择（仅存当前页面内存，不进会话快照）；
+  // 方案随当前字幕、最短时长 / 最小间隔约束与帧率实时重算，导出为只读操作
+  const [frameRateId, setFrameRateId] = useState(DEFAULT_FRAME_RATE_ID);
 
   /* ---------------- 本地会话恢复 / 自动保存 ---------------- */
   // 当前工作区绑定的会话 id：导入 SRT 时新建；恢复会话时沿用；空白工作区为 null
@@ -431,6 +442,13 @@ export default function App() {
           })
         : null,
     [levels, cues, gapThresholdDb, gapMergeBreak, gapTolerance, gapMinDuration]
+  );
+
+  // 帧率网格导出：在全部字幕的候选边界上联合选帧（动态规划），
+  // 随当前字幕、最短时长 / 最小间隔约束与目标帧率实时重算；纯只读，不写撤销历史
+  const framePlan = useMemo(
+    () => (cues.length > 0 ? planFrameGrid(cues, constraints, frameRateById(frameRateId)) : null),
+    [cues, constraints, frameRateId]
   );
 
   const seek = useCallback(
@@ -863,6 +881,36 @@ export default function App() {
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
     pushToast('info', '已导出按时间顺序重新编号的 SRT');
   }, [cues, srtName, pushToast]);
+
+  /**
+   * 帧率网格导出：把联合选帧方案按帧时间四舍五入到毫秒后下载 .frame.srt。
+   * 纯只读导出——不提交历史、不改动当前字幕；无解时按钮禁用，不会走到这里。
+   */
+  const exportFrameSrt = useCallback(() => {
+    if (!framePlan || !framePlan.feasible) return;
+    const mapped = applyFrameGrid(cues, framePlan);
+    if (!mapped) return;
+    const blob = new Blob([serializeSrt(mapped)], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const base = (srtName ?? 'subtitles.srt').replace(/\.srt$/i, '');
+    a.href = url;
+    a.download = `${base}.frame.srt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    pushToast(
+      'info',
+      `已按 ${framePlan.rate.label} 帧率网格导出（总误差 ${framePlan.totalErrorMs.toFixed(1)}ms，原字幕与撤销历史未改动）`
+    );
+  }, [cues, framePlan, srtName, pushToast]);
+
+  /** 定位帧率网格无解报告中首个无法接续的字幕（直接选中以保留进行中的漂移区间） */
+  const locateFrameFailure = useCallback((cueId: string) => {
+    setSelectedId(cueId);
+    setFocusNonce((n) => n + 1);
+  }, []);
 
   /* ---------------- 本地会话：自动保存 / 恢复 / 删除 ---------------- */
 
@@ -1410,6 +1458,15 @@ export default function App() {
             onToleranceChange={setGapTolerance}
             onMinDurationChange={setGapMinDuration}
             onLocate={handleGapLocate}
+          />
+          <FramePanel
+            cueCount={cues.length}
+            constraints={constraints}
+            rateId={frameRateId}
+            onRateChange={setFrameRateId}
+            plan={framePlan}
+            onExport={exportFrameSrt}
+            onLocate={locateFrameFailure}
           />
         </section>
         <CueList
